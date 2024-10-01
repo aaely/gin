@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -35,7 +36,7 @@ func main() {
 		}
 
 		// Ensure the upload directory exists
-		uploadPath := "/var/local/"
+		uploadPath := "/home/aely/.config/Neo4j Desktop/Application/relate-data/dbmss/dbms-872ee3a1-a519-4d89-9d25-45bf60d439a1/import"
 		if err := os.MkdirAll(uploadPath, os.ModePerm); err != nil {
 			c.String(http.StatusInternalServerError, fmt.Sprintf("could not create upload directory: %s", err.Error()))
 			return
@@ -51,78 +52,90 @@ func main() {
 		session := driver.NewSession(context.Background(), neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 		defer session.Close(context.Background())
 
-		_, err = session.ExecuteWrite(context.Background(), func(tx neo4j.ManagedTransaction) (interface{}, error) {
-			// Create the trailers and their corresponding load receipts
-			query1 := `
-            LOAD CSV WITH HEADERS FROM 'file:///` + file.Filename + `' AS line
-            MERGE (trailer.Trailer {id: line.TrailerID})
-			MERGE (sid: SID {id: line.SID, ciscoID: line.CiscoID})
-			ON CREATE SET sid.id = line.SID
-			MERGE (trailer)-[:HAS_SID]->(sid)
-			MERGE (sid)-[:HAS_PART]->(part:Part {number: line.PartNumber, quantity: toInteger(line.Quantity)})
-			MERGE (sid)-[:BELONGS_TO]->(trailer)
-            `
-			_, err := tx.Run(context.Background(), query1, nil)
-			if err != nil {
-				return nil, err
-			}
+		// Run queries using implicit transaction management in Neo4j
+		// Query 1: Create the trailers and their corresponding load receipts
+		query1 := `
+		CALL {
+		  LOAD CSV WITH HEADERS FROM 'file:///` + file.Filename + `' AS line
+		  MERGE (trailer:Trailer {id: line.TrailerID})
+		  MERGE (sid:SID {id: line.SID, ciscoID: line.CiscoID})
+		  ON CREATE SET sid.id = line.SID
+		  MERGE (trailer)-[:HAS_SID]->(sid)
+		  MERGE (sid)-[:HAS_PART]->(part:Part {number: line.PartNumber, quantity: toInteger(line.Quantity)})
+		  MERGE (sid)-[:BELONGS_TO]->(trailer)
+		} IN TRANSACTIONS OF 100 ROWS;
+		`
+		_, err = session.Run(context.Background(), query1, nil)
+		if err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("neo4j query err (query 1): %s", err.Error()))
+			return
+		}
 
-			// Create relations of TrailerID and CiscoIDs
-			query2 := `
-            LOAD CSV WITH HEADERS FROM 'file:///` + file.Filename + `' AS line
-            MERGE (trailer:Trailer {id: line.TrailerID})
-			MERGE (cisco:Cisco {id: line.CiscoID})
-			MERGE (trailer)-[:HAS_CISCO]->(cisco)
-            `
-			_, err = tx.Run(context.Background(), query2, nil)
-			if err != nil {
-				return nil, err
-			}
+		// Query 2: Create relations of TrailerID and CiscoIDs
+		query2 := `
+		CALL {
+		  LOAD CSV WITH HEADERS FROM 'file:///` + file.Filename + `' AS line
+		  MERGE (trailer:Trailer {id: line.TrailerID})
+		  MERGE (cisco:Cisco {id: line.CiscoID})
+		  MERGE (trailer)-[:HAS_CISCO]->(cisco)
+		} IN TRANSACTIONS OF 100 ROWS;
+		`
+		_, err = session.Run(context.Background(), query2, nil)
+		if err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("neo4j query err (query 2): %s", err.Error()))
+			return
+		}
 
-			// Create Schedule nodes for trailers that have no schedule node
-			query3 := `
-            LOAD CSV WITH HEADERS FROM 'file:///` + file.Filename + `' AS line
-			MATCH (trailer:Trailer)
-			WHERE NOT (trailer)-[:HAS_SCHEDULE]->(:Schedule)
-			CREATE (trailer)-[:HAS_SCHEDULE]->(S:Schedule{
+		// Query 3: Create Schedule nodes for trailers that have no schedule node
+		query3 := `
+		  MATCH (trailer:Trailer)
+		  WHERE NOT (trailer)-[:HAS_SCHEDULE]->(:Schedule)
+		  CREATE (trailer)-[:HAS_SCHEDULE]->(S:Schedule{
 			TrailerID: trailer.TrailerID,
 			RequestDate: '',
 			ScheduleDate: '',
 			ScheduleTime: '',
-			CarrierCode: '',
 			CarrierCode: '',
 			ArrivalTime: '',
 			DoorNumber: '',
 			Email: '',
 			LoadStatus: 'in-transit',
 			IsHot: false
-			})
-            `
-
-			_, err = tx.Run(context.Background(), query3, nil)
-			if err != nil {
-				return nil, err
-			}
-
-			// Merge Parts with TrailerIDs
-			query4 := `
-            MATCH (t:Trailer)-[:HAS_SID]->(sid:SID)-[:HAS_PART]->(p:Part)
-            ...
-            `
-
-			_, err = tx.Run(context.Background(), query4, nil)
-			return nil, err
-		})
-
+		  })
+		`
+		_, err = session.Run(context.Background(), query3, nil)
 		if err != nil {
-			c.String(http.StatusInternalServerError, fmt.Sprintf("neo4j query err: %s", err.Error()))
+			c.String(http.StatusInternalServerError, fmt.Sprintf("neo4j query err (query 3): %s", err.Error()))
 			return
 		}
 
+		// Query 4: Merge Parts with TrailerIDs
+		query4 := `
+		CALL {
+		  MATCH (t:Trailer)-[:HAS_SID]->(sid:SID)-[:HAS_PART]->(p:Part)
+		  MERGE (t)-[:CONTAINS_PART]->(p)
+		} IN TRANSACTIONS OF 100 ROWS;
+		`
+		_, err = session.Run(context.Background(), query4, nil)
+		if err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("neo4j query err (query 4): %s", err.Error()))
+			return
+		}
 		c.String(http.StatusOK, fmt.Sprintf("File %s uploaded successfully to %s and processed in Neo4j", file.Filename, filePath))
 	})
 
-	// Start the server on port 8080
-	router.Run(":8888")
-	//router.RunTLS(":8888", "/usr/local/share/ca-certificates/s.crt", "/home/aely/rocket_backend/certs/s.key")
+	srv := &http.Server{
+		Addr:         ":8888",
+		Handler:      router,
+		ReadTimeout:  5 * time.Minute, // Increase read timeout
+		WriteTimeout: 5 * time.Minute, // Increase write timeout
+	}
+
+	// Start the server with TLS
+	/*if err := srv.ListenAndServeTLS("/usr/local/share/ca-certificates/s.crt", "/home/aely/rocket_backend/certs/s.key"); err != nil && err != http.ErrServerClosed {
+		panic(fmt.Sprintf("Server error: %v", err))
+	}*/
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		panic(fmt.Sprintf("Server error: %v", err))
+	}
 }
